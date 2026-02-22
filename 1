@@ -1,0 +1,871 @@
+"""
+=============================================================================
+CASE STUDY: Medical Chest X-Ray Classification using Fine-Tuned ResNet50
+=============================================================================
+Domain     : Medical AI / Radiology / Computer Vision
+Model      : ResNet50 (pretrained on ImageNet)
+Task       : Multi-class X-ray image classification (4 classes)
+Classes    : Normal | Pneumonia | COVID-19 | Tuberculosis
+Framework  : PyTorch
+
+Fine-Tuning Strategy:
+  Phase 1 - Feature Extraction : Freeze backbone, train only new classifier head
+  Phase 2 - Full Fine-Tuning   : Unfreeze layer3 + layer4 + head with differential LRs
+  Phase 3 - Diagnostic         : Grad-CAM heatmaps for interpretability (critical in medical AI)
+
+Medical AI Considerations:
+  - Class imbalance handling via weighted loss
+  - High sensitivity (recall) prioritised for disease detection
+  - Grad-CAM visualisations for clinical explainability
+  - Per-class AUC-ROC reporting
+=============================================================================
+"""
+
+import os
+import copy
+import time
+import random
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import models, transforms
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             roc_auc_score, roc_curve)
+from sklearn.preprocessing import label_binarize
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 0.  GLOBAL CONFIG & REPRODUCIBILITY
+# ──────────────────────────────────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IMG_SIZE    = 224
+DATA_ROOT   = "./xray_dataset"
+OUTPUT_DIR  = "./outputs"
+CLASS_NAMES = ["Normal", "Pneumonia", "COVID-19", "Tuberculosis"]
+NUM_CLASSES = len(CLASS_NAMES)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"╔══════════════════════════════════════════════════════════╗")
+print(f"║  Medical X-Ray Classification  |  ResNet50  |  PyTorch  ║")
+print(f"╚══════════════════════════════════════════════════════════╝")
+print(f"  Device : {DEVICE}")
+print(f"  Classes: {CLASS_NAMES}\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  SYNTHETIC X-RAY DATASET GENERATION
+#     Creates realistic-looking grayscale X-ray images with class-specific
+#     visual signatures — simulating pathological patterns radiologists detect.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Visual profiles per class
+XRAY_PROFILES = {
+    "Normal": {
+        "base_brightness": 160,   # bright clear lungs
+        "lung_opacity":    0.0,   # no opacification
+        "infiltrate":      False,
+        "consolidation":   False,
+        "nodules":         0,
+    },
+    "Pneumonia": {
+        "base_brightness": 130,
+        "lung_opacity":    0.4,   # patchy infiltrates
+        "infiltrate":      True,
+        "consolidation":   True,
+        "nodules":         0,
+    },
+    "COVID-19": {
+        "base_brightness": 120,
+        "lung_opacity":    0.5,   # bilateral ground-glass opacities
+        "infiltrate":      True,
+        "consolidation":   False,
+        "nodules":         0,
+    },
+    "Tuberculosis": {
+        "base_brightness": 140,
+        "lung_opacity":    0.2,
+        "infiltrate":      False,
+        "consolidation":   False,
+        "nodules":         8,    # upper-lobe nodules
+    },
+}
+
+
+def _draw_lung_outline(draw, side: str, width: int, height: int, rng):
+    """Draw a simplified lung silhouette."""
+    cx = width // 4 if side == "left" else 3 * width // 4
+    cy = height // 2
+    rx = int(width * 0.18 + rng.randint(-5, 5))
+    ry = int(height * 0.28 + rng.randint(-5, 5))
+    shade = rng.randint(90, 130)
+    draw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
+                 fill=(shade, shade, shade))
+
+
+def make_xray_image(cls_name: str, img_id: int) -> Image.Image:
+    """
+    Generate a synthetic grayscale chest X-ray for the given class.
+    Uses class-specific visual patterns to simulate real pathology.
+    """
+    rng   = random.Random(img_id * 7 + CLASS_NAMES.index(cls_name) * 31)
+    prof  = XRAY_PROFILES[cls_name]
+    W, H  = IMG_SIZE, IMG_SIZE
+
+    # ── Base image: dark body background ──────────────────────────────────────
+    base = rng.randint(20, 45)
+    arr  = np.full((H, W), base, dtype=np.uint8)
+    arr += np.random.randint(-5, 5, (H, W), dtype=np.int8).astype(np.uint8)
+    img  = Image.fromarray(arr, "L").convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # ── Ribcage / spine guides ────────────────────────────────────────────────
+    spine_x = W // 2
+    draw.line([(spine_x, H // 6), (spine_x, 5 * H // 6)],
+              fill=(70, 70, 70), width=4)
+    for rib_y in range(H // 5, 4 * H // 5, H // 8):
+        shade = rng.randint(55, 75)
+        draw.arc([W // 8, rib_y, 7 * W // 8, rib_y + H // 9],
+                 start=0, end=180, fill=(shade, shade, shade), width=2)
+
+    # ── Lung fields ───────────────────────────────────────────────────────────
+    for side in ("left", "right"):
+        _draw_lung_outline(draw, side, W, H, rng)
+
+    # ── Pathological features ─────────────────────────────────────────────────
+    bright = prof["base_brightness"]
+
+    if prof["infiltrate"]:
+        # Patchy infiltrates across lung fields
+        n_patches = rng.randint(4, 10)
+        for _ in range(n_patches):
+            px = rng.randint(W // 8, 7 * W // 8)
+            py = rng.randint(H // 4, 3 * H // 4)
+            pr = rng.randint(10, 30)
+            shade = rng.randint(bright - 30, bright + 10)
+            draw.ellipse([px - pr, py - pr, px + pr, py + pr],
+                         fill=(shade, shade, shade))
+
+    if prof["consolidation"]:
+        # Lobar consolidation — larger, denser opacification
+        for side_offset in [W // 4, 3 * W // 4]:
+            shade = rng.randint(bright - 10, bright + 20)
+            draw.ellipse([side_offset - 35, H // 2 - 25,
+                          side_offset + 35, H // 2 + 35],
+                         fill=(shade, shade, shade))
+
+    if cls_name == "COVID-19":
+        # Bilateral peripheral ground-glass opacities (hallmark of COVID-19)
+        for cx in [W // 5, 4 * W // 5]:
+            for cy_off in [H // 3, H // 2, 2 * H // 3]:
+                shade = rng.randint(bright - 20, bright)
+                r = rng.randint(15, 28)
+                draw.ellipse([cx - r, cy_off - r, cx + r, cy_off + r],
+                             fill=(shade, shade, shade))
+
+    if prof["nodules"] > 0:
+        # Upper-lobe nodules (Tuberculosis signature)
+        for _ in range(prof["nodules"]):
+            nx = rng.randint(W // 6, 5 * W // 6)
+            ny = rng.randint(H // 5, H // 3)  # upper lobes
+            nr = rng.randint(4, 12)
+            shade = rng.randint(bright, bright + 40)
+            draw.ellipse([nx - nr, ny - nr, nx + nr, ny + nr],
+                         fill=(shade, shade, shade))
+
+    # ── Heart silhouette ──────────────────────────────────────────────────────
+    hx, hy = W // 2 + 15, H // 2 - 10
+    draw.ellipse([hx - 28, hy - 22, hx + 28, hy + 22],
+                 fill=(50, 50, 50))
+
+    # ── Post-processing: blur + contrast (simulate X-ray texture) ────────────
+    img = img.filter(ImageFilter.GaussianBlur(radius=1.5))
+    img = ImageEnhance.Contrast(img).enhance(1.3)
+    img = ImageEnhance.Brightness(img).enhance(prof["base_brightness"] / 128)
+
+    return img
+
+
+def generate_dataset(root: str, samples_per_class: dict):
+    """
+    Build train / val / test splits.
+    Reflects real-world class imbalance: Normal is most common.
+    """
+    splits = {"train": 0.70, "val": 0.15, "test": 0.15}
+    print("[DATA] Generating synthetic chest X-ray dataset ...")
+
+    for cls_name in CLASS_NAMES:
+        n_total = samples_per_class[cls_name]
+        imgs    = [make_xray_image(cls_name, i) for i in range(n_total)]
+        idx     = 0
+        for split, ratio in splits.items():
+            n        = max(1, int(n_total * ratio))
+            split_dir = os.path.join(root, split, cls_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for j in range(n):
+                if idx >= len(imgs):
+                    break
+                imgs[idx].save(os.path.join(split_dir, f"{cls_name}_{idx:04d}.jpg"))
+                idx += 1
+
+    print(f"[DATA] Dataset saved → '{root}'")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  DATASET CLASS
+# ──────────────────────────────────────────────────────────────────────────────
+class ChestXRayDataset(Dataset):
+    """PyTorch Dataset for chest X-ray classification."""
+
+    def __init__(self, root_dir: str, split: str, transform=None):
+        self.transform = transform
+        self.samples   = []
+
+        split_dir = os.path.join(root_dir, split)
+        for label, cls in enumerate(CLASS_NAMES):
+            cls_dir = os.path.join(split_dir, cls)
+            if not os.path.isdir(cls_dir):
+                continue
+            for f in sorted(os.listdir(cls_dir)):
+                if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    self.samples.append((os.path.join(cls_dir, f), label))
+
+        counts = {c: 0 for c in CLASS_NAMES}
+        for _, lbl in self.samples:
+            counts[CLASS_NAMES[lbl]] += 1
+        dist = "  |  ".join(f"{c}: {counts[c]}" for c in CLASS_NAMES)
+        print(f"  [{split:>5}] {len(self.samples):>4} samples  →  {dist}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+    def get_class_weights(self) -> torch.Tensor:
+        """Compute inverse-frequency class weights for imbalanced data."""
+        counts = torch.zeros(NUM_CLASSES)
+        for _, lbl in self.samples:
+            counts[lbl] += 1
+        weights = 1.0 / (counts + 1e-6)
+        return weights / weights.sum() * NUM_CLASSES
+
+    def get_sample_weights(self) -> list:
+        """Per-sample weights for WeightedRandomSampler."""
+        class_weights = self.get_class_weights().numpy()
+        return [class_weights[lbl] for _, lbl in self.samples]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  TRANSFORMS
+# ──────────────────────────────────────────────────────────────────────────────
+def get_transforms():
+    """
+    Medical imaging augmentation strategy:
+      - Minimal colour jitter (X-rays are grayscale by nature)
+      - Slight random affine to simulate patient positioning variation
+      - NO aggressive cropping (could remove diagnostically important regions)
+    """
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+
+    train_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        transforms.RandomAutocontrast(p=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    eval_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    return train_tf, eval_tf
+
+
+def get_dataloaders(root: str, batch_size: int = 32):
+    train_tf, eval_tf = get_transforms()
+    print("[DATA] Loading datasets ...")
+
+    train_ds = ChestXRayDataset(root, "train", train_tf)
+    val_ds   = ChestXRayDataset(root, "val",   eval_tf)
+    test_ds  = ChestXRayDataset(root, "test",  eval_tf)
+
+    # Weighted sampler addresses class imbalance during training
+    sample_weights = train_ds.get_sample_weights()
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+    loaders = {
+        "train": DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                            num_workers=0, pin_memory=False),
+        "val":   DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=False),
+        "test":  DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=False),
+    }
+    return loaders, {"train": train_ds, "val": val_ds, "test": test_ds}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.  MODEL — FINE-TUNED RESNET50
+# ──────────────────────────────────────────────────────────────────────────────
+class MedicalResNet50(nn.Module):
+    """
+    ResNet50 adapted for medical X-ray classification.
+
+    Architectural modifications vs vanilla ResNet50:
+      1. Custom multi-layer classifier head with BatchNorm + Dropout
+      2. Squeeze-and-Excitation (SE) block inserted before classifier
+         → Re-weights channel features (mimics attention over lung regions)
+      3. Dual-output: logits + feature embeddings (for Grad-CAM)
+    """
+
+    def __init__(self, num_classes: int, dropout: float = 0.5):
+        super().__init__()
+
+        backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+
+        # ── Freeze entire backbone ────────────────────────────────────────────
+        for p in backbone.parameters():
+            p.requires_grad = False
+
+        # ── Extract feature layers (everything except avgpool + fc) ──────────
+        self.features = nn.Sequential(
+            backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
+            backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4
+        )
+        self.avgpool = backbone.avgpool     # Global Average Pooling → (B, 2048, 1, 1)
+
+        # ── Squeeze-and-Excitation block (channel attention) ─────────────────
+        self.se_block = nn.Sequential(
+            nn.Linear(2048, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 2048),
+            nn.Sigmoid()
+        )
+
+        # ── Medical classifier head ───────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(2048),
+            nn.Dropout(dropout),
+            nn.Linear(2048, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.3),
+            nn.Linear(256, num_classes),
+        )
+
+        # Gradient storage for Grad-CAM
+        self.gradients  = None
+        self.activations = None
+
+    def _hook_fn(self, module, input, output):
+        self.activations = output
+
+    def _grad_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def register_hooks(self):
+        """Register forward/backward hooks on the last conv block for Grad-CAM."""
+        last_conv = self.features[-1][-1].conv3  # layer4 > last bottleneck > conv3
+        last_conv.register_forward_hook(self._hook_fn)
+        last_conv.register_full_backward_hook(self._grad_hook)
+
+    def forward(self, x):
+        feat = self.features(x)                    # (B, 2048, 7, 7)
+        pool = self.avgpool(feat).flatten(1)        # (B, 2048)
+
+        # Channel attention via SE block
+        se   = self.se_block(pool)
+        pool = pool * se                            # (B, 2048)
+
+        return self.classifier(pool)               # (B, num_classes)
+
+    def unfreeze_top_layers(self, num_blocks: int = 2):
+        """Unfreeze last `num_blocks` ResNet layers + classifier."""
+        layers = [self.features[-i] for i in range(1, num_blocks + 1)]
+        layers += [self.se_block, self.classifier]
+        for layer in layers:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"  Trainable : {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  FOCAL LOSS — Better than CrossEntropy for class imbalance
+# ──────────────────────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    """
+    Focal Loss (Lin et al. 2017) — focuses training on hard, misclassified examples.
+    Particularly useful in medical imaging where rare diseases are hard to detect.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(self, gamma: float = 2.0, alpha: torch.Tensor = None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none",
+                                  weight=self.alpha.to(inputs.device) if self.alpha is not None else None)
+        pt      = torch.exp(-ce_loss)
+        focal   = ((1 - pt) ** self.gamma) * ce_loss
+        return focal.mean()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6.  TRAINING ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
+    model.train()
+    running_loss = correct = total = 0
+
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+
+        outputs = model(imgs)
+        loss    = criterion(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        running_loss += loss.item() * imgs.size(0)
+        correct      += outputs.argmax(1).eq(labels).sum().item()
+        total        += labels.size(0)
+
+    return running_loss / total, correct / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    running_loss = correct = total = 0
+    all_preds, all_labels, all_probs = [], [], []
+
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        outputs = model(imgs)
+        loss    = criterion(outputs, labels)
+
+        running_loss += loss.item() * imgs.size(0)
+        probs  = F.softmax(outputs, dim=1)
+        preds  = outputs.argmax(1)
+        correct += preds.eq(labels).sum().item()
+        total   += labels.size(0)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+    return running_loss / total, correct / total, all_preds, all_labels, np.array(all_probs)
+
+
+def run_phase(model, loaders, criterion, optimizer, scheduler, device,
+              epochs: int, label: str):
+    """Full training phase with early-stopping-ready loop."""
+    history     = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    best_acc    = 0.0
+    best_state  = copy.deepcopy(model.state_dict())
+
+    print(f"\n{'━'*62}")
+    print(f"  {label}")
+    print(f"{'━'*62}")
+
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc   = train_one_epoch(model, loaders["train"], criterion, optimizer, device)
+        vl_loss, vl_acc, *_ = evaluate(model, loaders["val"], criterion, device)
+        scheduler.step(vl_loss)
+
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(vl_loss)
+        history["train_acc"].append(tr_acc)
+        history["val_acc"].append(vl_acc)
+
+        if vl_acc > best_acc:
+            best_acc   = vl_acc
+            best_state = copy.deepcopy(model.state_dict())
+            tag = " ✓ best"
+        else:
+            tag = ""
+
+        print(f"  Epoch {epoch:02d}/{epochs}  "
+              f"train=[loss:{tr_loss:.4f} acc:{tr_acc:.4f}]  "
+              f"val=[loss:{vl_loss:.4f} acc:{vl_acc:.4f}]{tag}  "
+              f"[{time.time()-t0:.1f}s]")
+
+    print(f"  Best val accuracy: {best_acc:.4f}")
+    model.load_state_dict(best_state)
+    return history
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7.  GRAD-CAM VISUALISATION
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_gradcam(model, img_tensor: torch.Tensor, target_class: int, device) -> np.ndarray:
+    """
+    Grad-CAM: produces a heatmap highlighting image regions
+    most influential for the predicted class.
+    Essential for medical AI explainability.
+    """
+    model.eval()
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+    img_tensor.requires_grad_(True)
+
+    output = model(img_tensor)
+    score  = output[0, target_class]
+    model.zero_grad()
+    score.backward()
+
+    if model.gradients is None or model.activations is None:
+        return np.zeros((IMG_SIZE, IMG_SIZE))
+
+    grads = model.gradients[0]            # (C, H, W)
+    acts  = model.activations[0]          # (C, H, W)
+    weights = grads.mean(dim=(1, 2))      # Global Average Pooling over spatial dims
+
+    cam = (weights[:, None, None] * acts).sum(0)
+    cam = F.relu(cam)
+    cam = cam.detach().cpu().numpy()
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+    # Resize to input image size
+    cam_img = Image.fromarray((cam * 255).astype(np.uint8)).resize(
+        (IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+    return np.array(cam_img) / 255.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  VISUALISATION SUITE
+# ──────────────────────────────────────────────────────────────────────────────
+def denorm(tensor):
+    mean = torch.tensor([0.485, 0.456, 0.406])
+    std  = torch.tensor([0.229, 0.224, 0.225])
+    img  = tensor.cpu() * std[:, None, None] + mean[:, None, None]
+    return img.permute(1, 2, 0).clamp(0, 1).numpy()
+
+
+def plot_class_distribution(root: str, path: str):
+    counts = {s: {c: 0 for c in CLASS_NAMES} for s in ["train", "val", "test"]}
+    for split in counts:
+        for cls in CLASS_NAMES:
+            d = os.path.join(root, split, cls)
+            if os.path.isdir(d):
+                counts[split][cls] = len(os.listdir(d))
+
+    x  = np.arange(len(CLASS_NAMES))
+    w  = 0.25
+    fig, ax = plt.subplots(figsize=(11, 5))
+    colors  = ["#4C72B0", "#DD8452", "#55A868"]
+    for i, (split, col) in enumerate(zip(["train", "val", "test"], colors)):
+        vals = [counts[split][c] for c in CLASS_NAMES]
+        ax.bar(x + i * w, vals, w, label=split.capitalize(), color=col)
+
+    ax.set_xticks(x + w)
+    ax.set_xticklabels(CLASS_NAMES, fontsize=11)
+    ax.set_ylabel("Number of Images", fontsize=11)
+    ax.set_title("Chest X-Ray Dataset — Class Distribution", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] Class distribution  → {path}")
+    plt.close()
+
+
+def plot_training_curves(h1, h2, path: str):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle("ResNet50 Fine-Tuning — Medical X-Ray Classification\nTraining Curves",
+                 fontsize=14, fontweight="bold")
+
+    for col, (h, lbl) in enumerate([(h1, "Phase 1: Feature Extraction"),
+                                     (h2, "Phase 2: Full Fine-Tuning")]):
+        ep = range(1, len(h["train_loss"]) + 1)
+
+        axes[0][col].plot(ep, h["train_loss"], "b-o", markersize=5, label="Train")
+        axes[0][col].plot(ep, h["val_loss"],   "r-o", markersize=5, label="Val")
+        axes[0][col].set_title(f"{lbl}\nFocal Loss")
+        axes[0][col].set_xlabel("Epoch"); axes[0][col].set_ylabel("Loss")
+        axes[0][col].legend(); axes[0][col].grid(alpha=0.3)
+
+        axes[1][col].plot(ep, h["train_acc"], "b-o", markersize=5, label="Train")
+        axes[1][col].plot(ep, h["val_acc"],   "r-o", markersize=5, label="Val")
+        axes[1][col].set_title(f"{lbl}\nAccuracy")
+        axes[1][col].set_xlabel("Epoch"); axes[1][col].set_ylabel("Accuracy")
+        axes[1][col].set_ylim(0, 1); axes[1][col].legend(); axes[1][col].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] Training curves     → {path}")
+    plt.close()
+
+
+def plot_confusion_matrix(labels, preds, path: str):
+    cm  = confusion_matrix(labels, preds)
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Confusion Matrix — Test Set (ResNet50 Fine-Tuned)",
+                 fontsize=13, fontweight="bold")
+
+    for ax, data, title, fmt in [
+        (axes[0], cm,      "Counts",       "d"),
+        (axes[1], cm_norm, "Normalised",   ".2f"),
+    ]:
+        sns.heatmap(data, annot=True, fmt=fmt, cmap="Blues",
+                    xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax,
+                    linewidths=0.5, linecolor="gray")
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] Confusion matrix    → {path}")
+    plt.close()
+
+
+def plot_roc_curves(labels, probs, path: str):
+    """Multi-class One-vs-Rest AUC-ROC curves — critical metric in medical AI."""
+    labels_bin = label_binarize(labels, classes=range(NUM_CLASSES))
+    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    aucs = []
+    for i, (cls, col) in enumerate(zip(CLASS_NAMES, colors)):
+        fpr, tpr, _ = roc_curve(labels_bin[:, i], probs[:, i])
+        auc = roc_auc_score(labels_bin[:, i], probs[:, i])
+        aucs.append(auc)
+        ax.plot(fpr, tpr, color=col, lw=2, label=f"{cls}  (AUC = {auc:.3f})")
+
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate",  fontsize=12)
+    ax.set_title(f"AUC-ROC Curves — One-vs-Rest\n"
+                 f"Mean AUC = {np.mean(aucs):.3f}",
+                 fontsize=13, fontweight="bold")
+    ax.legend(fontsize=11); ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] ROC curves          → {path}")
+    plt.close()
+    return dict(zip(CLASS_NAMES, aucs))
+
+
+def plot_gradcam_grid(model, dataset, device, path: str, n: int = 8):
+    """Grad-CAM heatmaps overlaid on X-ray images — explainability for clinicians."""
+    model.eval()
+    indices = random.sample(range(len(dataset)), min(n, len(dataset)))
+    fig, axes = plt.subplots(2, n, figsize=(n * 2.2, 6))
+    fig.suptitle("Grad-CAM Visualisations — Regions Driving Predictions\n"
+                 "(Green border = Correct  |  Red border = Incorrect)",
+                 fontsize=12, fontweight="bold")
+
+    for col, idx in enumerate(indices):
+        img_t, true_lbl = dataset[idx]
+        with torch.no_grad():
+            logits = model(img_t.unsqueeze(0).to(device))
+            pred   = logits.argmax(1).item()
+            conf   = F.softmax(logits, dim=1).max().item()
+
+        cam  = generate_gradcam(model, img_t, pred, device)
+        orig = denorm(img_t)
+
+        # Original image
+        axes[0][col].imshow(orig)
+        correct = pred == true_lbl
+        color   = "lime" if correct else "red"
+        for spine in axes[0][col].spines.values():
+            spine.set_edgecolor(color); spine.set_linewidth(3)
+        axes[0][col].set_title(
+            f"T:{CLASS_NAMES[true_lbl][:4]}\nP:{CLASS_NAMES[pred][:4]} {conf:.0%}",
+            fontsize=7, color=color
+        )
+        axes[0][col].axis("off")
+
+        # Grad-CAM overlay
+        axes[1][col].imshow(orig)
+        axes[1][col].imshow(cam, cmap="jet", alpha=0.45)
+        axes[1][col].set_title("Grad-CAM", fontsize=7)
+        axes[1][col].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] Grad-CAM grid       → {path}")
+    plt.close()
+
+
+def plot_per_class_sensitivity(labels, preds, path: str):
+    """
+    Sensitivity (Recall) per class bar chart.
+    In medical AI, sensitivity = most critical metric
+    (missing a disease is worse than a false alarm).
+    """
+    report = classification_report(labels, preds,
+                                   target_names=CLASS_NAMES, output_dict=True)
+    sens   = [report[c]["recall"] for c in CLASS_NAMES]
+    precs  = [report[c]["precision"] for c in CLASS_NAMES]
+    f1s    = [report[c]["f1-score"] for c in CLASS_NAMES]
+
+    x    = np.arange(len(CLASS_NAMES))
+    w    = 0.25
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - w, sens,  w, label="Sensitivity (Recall)", color="#55A868")
+    ax.bar(x,     precs, w, label="Precision",             color="#4C72B0")
+    ax.bar(x + w, f1s,   w, label="F1-Score",              color="#DD8452")
+
+    ax.set_xticks(x); ax.set_xticklabels(CLASS_NAMES, fontsize=11)
+    ax.set_ylim(0, 1.1)
+    ax.axhline(0.9, color="red", ls="--", lw=1, label="Clinical threshold (0.90)")
+    ax.set_ylabel("Score", fontsize=11)
+    ax.set_title("Per-Class Performance Metrics\n(Sensitivity is Most Critical for Disease Detection)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  [PLOT] Sensitivity chart   → {path}")
+    plt.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9.  MAIN PIPELINE
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    # ── Hyper-parameters ──────────────────────────────────────────────────────
+    BATCH_SIZE    = 32
+    P1_EPOCHS     = 8   # Feature extraction
+    P2_EPOCHS     = 12  # Full fine-tuning
+    P1_LR         = 1e-3
+    P2_LR         = 1e-4
+    WEIGHT_DECAY  = 1e-4
+    DROPOUT       = 0.5
+    FOCAL_GAMMA   = 2.0
+
+    # Reflects real-world clinical imbalance (Normal >> Disease)
+    SAMPLES = {"Normal": 250, "Pneumonia": 180, "COVID-19": 150, "Tuberculosis": 120}
+
+    # ── Generate synthetic data ───────────────────────────────────────────────
+    if not os.path.exists(DATA_ROOT):
+        generate_dataset(DATA_ROOT, SAMPLES)
+
+    loaders, datasets = get_dataloaders(DATA_ROOT, BATCH_SIZE)
+
+    # ── Class weights for Focal Loss ──────────────────────────────────────────
+    class_weights = datasets["train"].get_class_weights()
+    print(f"\n[INFO] Class weights: { {c: f'{w:.3f}' for c, w in zip(CLASS_NAMES, class_weights)} }")
+
+    # ── Build model ───────────────────────────────────────────────────────────
+    model = MedicalResNet50(NUM_CLASSES, DROPOUT).to(DEVICE)
+    model.register_hooks()   # Required for Grad-CAM
+
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n[MODEL] ResNet50 + SE block + custom head loaded")
+    print(f"  Total params    : {total:,}")
+    print(f"  Phase 1 trainable: {trainable:,} ({100*trainable/total:.1f}%)")
+
+    criterion = FocalLoss(gamma=FOCAL_GAMMA, alpha=class_weights)
+
+    # ── Phase 1: Feature Extraction ───────────────────────────────────────────
+    opt1   = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
+                        lr=P1_LR, weight_decay=WEIGHT_DECAY)
+    sched1 = optim.lr_scheduler.ReduceLROnPlateau(opt1, patience=3, factor=0.5, verbose=False)
+
+    h1 = run_phase(model, loaders, criterion, opt1, sched1, DEVICE,
+                   P1_EPOCHS, "Phase 1: Feature Extraction (backbone frozen)")
+
+    # ── Phase 2: Full Fine-Tuning ─────────────────────────────────────────────
+    print(f"\n[INFO] Unfreezing top ResNet blocks ...")
+    model.unfreeze_top_layers(num_blocks=2)
+
+    opt2 = optim.AdamW([
+        {"params": model.features[-2].parameters(), "lr": P2_LR * 0.1},   # layer3
+        {"params": model.features[-1].parameters(), "lr": P2_LR * 0.5},   # layer4
+        {"params": model.se_block.parameters(),     "lr": P2_LR},
+        {"params": model.classifier.parameters(),   "lr": P2_LR},
+    ], weight_decay=WEIGHT_DECAY)
+    sched2 = optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=P2_EPOCHS, eta_min=1e-6)
+
+    h2 = run_phase(model, loaders, criterion, opt2, sched2, DEVICE,
+                   P2_EPOCHS, "Phase 2: Full Fine-Tuning (differential LR)")
+
+    # ── Final Evaluation ──────────────────────────────────────────────────────
+    print(f"\n{'━'*62}")
+    print(f"  FINAL TEST SET EVALUATION")
+    print(f"{'━'*62}")
+    _, acc, preds, labels, probs = evaluate(model, loaders["test"], criterion, DEVICE)
+    print(f"  Test Accuracy : {acc:.4f}  ({acc*100:.2f}%)\n")
+    print(classification_report(labels, preds, target_names=CLASS_NAMES, digits=4))
+
+    # AUC-ROC
+    try:
+        aucs = {c: roc_auc_score(
+            label_binarize(labels, classes=range(NUM_CLASSES))[:, i], probs[:, i]
+        ) for i, c in enumerate(CLASS_NAMES)}
+        print("  AUC-ROC per class:")
+        for c, a in aucs.items():
+            print(f"    {c:<15} {a:.4f}")
+    except Exception:
+        pass
+
+    # ── Save model checkpoint ─────────────────────────────────────────────────
+    ckpt_path = os.path.join(OUTPUT_DIR, "resnet50_xray_classifier.pth")
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "class_names":      CLASS_NAMES,
+        "test_accuracy":    acc,
+        "phase1_history":   h1,
+        "phase2_history":   h2,
+    }, ckpt_path)
+    print(f"\n  Model saved → {ckpt_path}")
+
+    # ── Generate all plots ────────────────────────────────────────────────────
+    print("\n[PLOTS] Generating visualisations ...")
+    plot_class_distribution(DATA_ROOT,
+        os.path.join(OUTPUT_DIR, "1_class_distribution.png"))
+    plot_training_curves(h1, h2,
+        os.path.join(OUTPUT_DIR, "2_training_curves.png"))
+    plot_confusion_matrix(labels, preds,
+        os.path.join(OUTPUT_DIR, "3_confusion_matrix.png"))
+    plot_roc_curves(labels, probs,
+        os.path.join(OUTPUT_DIR, "4_roc_curves.png"))
+    plot_per_class_sensitivity(labels, preds,
+        os.path.join(OUTPUT_DIR, "5_sensitivity_chart.png"))
+    plot_gradcam_grid(model, datasets["test"], DEVICE,
+        os.path.join(OUTPUT_DIR, "6_gradcam_visualisations.png"))
+
+    print(f"\n✅  All outputs saved to ./{OUTPUT_DIR}/")
+    print(f"{'═'*62}")
+
+
+if __name__ == "__main__":
+    main()
